@@ -15,6 +15,9 @@
 #define FILELOCK_INTERRUPT_INTERVAL 200
 
 struct sigaction filelock_old_sa;
+struct sigaction filelock_old_sigint_sa;
+
+int *filedes_ptr = NULL;
 
 void filelock__finalizer(SEXP x) {
   filelock__list_t *ptr = (filelock__list_t*) R_ExternalPtrAddr(x);
@@ -33,6 +36,16 @@ void filelock__finalizer(SEXP x) {
 void filelock__alarm_callback (int signum) {
   /* Restore signal handler */
   sigaction(SIGALRM, &filelock_old_sa, 0);
+}
+
+void filelock__sigint_callback (int signum) {
+  if ( filedes_ptr != NULL ) {
+    close(*filedes_ptr);
+    filedes_ptr = NULL;
+  }
+  /* Restore old signal handler and raise immediately */
+  sigaction(SIGINT, &filelock_old_sigint_sa, 0);
+  raise(SIGINT);
 }
 
 int filelock__interruptible(int filedes, struct flock *lck,
@@ -95,6 +108,16 @@ SEXP filelock_lock(SEXP path, SEXP exclusive, SEXP timeout) {
   int c_exclusive = LOGICAL(exclusive)[0];
   int c_timeout = INTEGER(timeout)[0];
   int filedes, ret;
+  struct sigaction sa;
+  struct sigaction old_sa;
+
+  /* handle sigint */
+  sigaction(SIGINT,NULL,&old_sa);
+  if ( old_sa.sa_handler != filelock__sigint_callback ) {
+    memset(&sa, 0, sizeof (sa));
+    sa.sa_handler = &filelock__sigint_callback;
+    sigaction(SIGINT, &sa, &filelock_old_sigint_sa);
+  }
 
   /* Check if this file was already locked. */
   filelock__list_t *node = filelock__list_find(c_path);
@@ -117,12 +140,16 @@ SEXP filelock_lock(SEXP path, SEXP exclusive, SEXP timeout) {
   filedes = open(c_path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
   if (filedes == -1) error("Cannot open lock file: %s", strerror(errno));
 
+  filedes_ptr = &filedes;
+
   /* One shot only? Do not block if cannot lock */
   if (c_timeout == 0) {
     ret = fcntl(filedes, F_SETLK, &lck);
     if (ret == -1) {
+      close(filedes);
+      filedes_ptr = NULL;
       if (errno == EAGAIN || errno == EACCES) {
-	return R_NilValue;
+        return R_NilValue;
       }
       error("Cannot lock file: '%s': %s", c_path, strerror(errno));
     }
@@ -132,8 +159,13 @@ SEXP filelock_lock(SEXP path, SEXP exclusive, SEXP timeout) {
 				  c_timeout);
   }
 
+  /* restore sigint handler */
+  sigaction(SIGINT, &filelock_old_sigint_sa, 0);
+  filedes_ptr = NULL;
+
   /* Failed to acquire the lock? */
   if (ret) {
+    close(filedes);
     return R_NilValue;
   } else {
     return filelock__list_add(c_path, filedes, c_exclusive);
