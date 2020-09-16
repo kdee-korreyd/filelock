@@ -11,10 +11,16 @@
 #include <sys/stat.h>
 
 #include "filelock.h"
+#include "cleancall.h"
 
 #define FILELOCK_INTERRUPT_INTERVAL 200
 
 struct sigaction filelock_old_sa;
+
+struct filedes_ret {
+  int filedes;
+  int ret;
+};
 
 void filelock__finalizer(SEXP x) {
   filelock__list_t *ptr = (filelock__list_t*) R_ExternalPtrAddr(x);
@@ -33,6 +39,15 @@ void filelock__finalizer(SEXP x) {
 void filelock__alarm_callback (int signum) {
   /* Restore signal handler */
   sigaction(SIGALRM, &filelock_old_sa, 0);
+}
+
+void filelock__close_fd (void *ptr) {
+  struct filedes_ret *fr = ptr;
+  if ( fr->ret && fr->filedes >= 0 ) {
+    close(fr->filedes);
+  }
+  /* free */
+  free(fr);
 }
 
 int filelock__interruptible(int filedes, struct flock *lck,
@@ -94,8 +109,9 @@ SEXP filelock_lock(SEXP path, SEXP exclusive, SEXP timeout) {
   const char *c_path = CHAR(STRING_ELT(path, 0));
   int c_exclusive = LOGICAL(exclusive)[0];
   int c_timeout = INTEGER(timeout)[0];
-  int filedes, ret;
-
+  struct filedes_ret *fr = malloc (sizeof (struct filedes_ret));
+  fr->ret = fr->filedes = -1;
+  
   /* Check if this file was already locked. */
   filelock__list_t *node = filelock__list_find(c_path);
   if (node) {
@@ -114,13 +130,15 @@ SEXP filelock_lock(SEXP path, SEXP exclusive, SEXP timeout) {
   lck.l_start = 0;
   lck.l_len = 0;
 
-  filedes = open(c_path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-  if (filedes == -1) error("Cannot open lock file: %s", strerror(errno));
+  fr->filedes = open(c_path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+  if (fr->filedes == -1) error("Cannot open lock file: %s", strerror(errno));
+
+  r_call_on_exit(filelock__close_fd, fr);
 
   /* One shot only? Do not block if cannot lock */
   if (c_timeout == 0) {
-    ret = fcntl(filedes, F_SETLK, &lck);
-    if (ret == -1) {
+    fr->ret = fcntl(fr->filedes, F_SETLK, &lck);
+    if (fr->ret == -1) {
       if (errno == EAGAIN || errno == EACCES) {
 	return R_NilValue;
       }
@@ -128,15 +146,15 @@ SEXP filelock_lock(SEXP path, SEXP exclusive, SEXP timeout) {
     }
 
   } else {
-    ret = filelock__interruptible(filedes, &lck, c_path, c_exclusive,
+    fr->ret = filelock__interruptible(fr->filedes, &lck, c_path, c_exclusive,
 				  c_timeout);
   }
 
   /* Failed to acquire the lock? */
-  if (ret) {
+  if (fr->ret) {
     return R_NilValue;
   } else {
-    return filelock__list_add(c_path, filedes, c_exclusive);
+    return filelock__list_add(c_path, fr->filedes, c_exclusive);
   }
 }
 
